@@ -1,0 +1,118 @@
+name: Build Release
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: ""
+        required: false
+        type: string
+
+  push:
+    branches:
+      - build
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{steps.create_release.outputs.upload_url}}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{inputs.commit || github.sha }}
+
+      - name: VSCode Version
+        id: version
+        run: |-
+          echo "VERSION=`cat package.json | jq '.version' | sed 's|"||g'`" | tee -a $GITHUB_OUTPUT
+
+      - name: Generate filename and tag name
+        id: filename_tag
+        run: |-
+          echo TAG="${{ steps.version.outputs.VERSION }}" | tee -a $GITHUB_OUTPUT
+          echo FILENAME="vscode-reh-web-${{matrix.type}}-min-${{ steps.version.outputs.VERSION }}-custom-build.tar" | tee -a $GITHUB_OUTPUT
+      - name: Delete existing release and tag if exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |-
+          gh release delete ${{ steps.filename_tag.outputs.TAG }} --cleanup-tag || true
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
+        with:
+          tag_name: ${{ steps.filename_tag.outputs.TAG }}
+          release_name: Release ${{ steps.filename_tag.outputs.TAG }}
+          body: ""
+          draft: false
+          prerelease: false
+
+  compile:
+    needs: ["release"]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        type:
+          - linux-arm64
+          - linux-x64
+          - win32-x64
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{inputs.commit || github.sha }}
+
+      - name: VSCode Version
+        id: version
+        run: |-
+          echo "VERSION=`cat package.json | jq '.version' | sed 's|"||g'`" | tee -a $GITHUB_OUTPUT
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: |-
+          sudo apt update && sudo apt-get install -y build-essential g++ libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev python-is-python3
+          npm install --global yarn
+          yarn install
+
+      - name: Generate filename and tag name
+        id: filename_tag
+        run: |-
+          echo FILENAME="vscode-reh-web-${{matrix.type}}-min-${{ steps.version.outputs.VERSION }}.tar" | tee -a $GITHUB_OUTPUT
+
+      - name: Add gallery extension and update product.json
+        run: |-
+          export DATETIME=`TZ='Asia/Singapore' date +%d-%b-%YT%H:%M:%S%z`
+          jq -s '.[0] * .[1]' product.json product-patch.json > product-updated.json && mv product-updated.json product.json
+          jq '. |= . + {commit : "${{inputs.commit || github.sha }}" }' product.json | envsubst > product-updated.json && mv product-updated.json product.json
+          jq '. |= . + {date : "$DATETIME"}' product.json | envsubst > product-updated.json && mv product-updated.json product.json
+          jq '. |= . + {version : "${{ steps.version.outputs.VERSION }}"}' product.json > product-updated.json && mv product-updated.json product.json
+          cat product.json
+
+      - name: Build Release
+        run: |-
+          yarn gulp vscode-reh-web-${{matrix.type}}-min
+
+      - name: Package Release
+        run: |-
+          (cd ../vscode-reh-web-${{matrix.type}} && tar -cf ../vscode/${{ steps.filename_tag.outputs.FILENAME }} *)
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifact-${{matrix.type}}
+          path: ${{ steps.filename_tag.outputs.FILENAME }}
+
+      - name: Upload release assets
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ needs.release.outputs.upload_url }}
+          asset_path: ${{ steps.filename_tag.outputs.FILENAME }}
+          asset_name: ${{ steps.filename_tag.outputs.FILENAME }}
+          asset_content_type: application/x-tar
